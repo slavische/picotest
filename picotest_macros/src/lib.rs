@@ -48,71 +48,121 @@ static UNIT_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 #[proc_macro_attribute]
 pub fn picotest_unit(_: TokenStream, tokens: TokenStream) -> TokenStream {
     match parse_macro_input!(tokens as Item) {
-        Item::Fn(mut test_fn) => {
-            let test_fn_attrs = test_fn.attrs.clone();
-            let test_fn_name = test_fn.sig.ident.to_string();
-            // We want test routine to be called through FFI.
-            // So mark it as 'pub extern "C"'.
-            test_fn.vis = parse_quote! { pub };
-            test_fn.sig.abi = parse_quote! { extern "C" };
-            // Set no mangle attribute to avoid spoiling of function signature.
-            test_fn.attrs = vec![
-                parse_quote! { #[allow(dead_code)]  },
-                parse_quote! { #[unsafe(no_mangle)] },
-            ];
-
-            // Create test runner - it's a wrapper around main test function.
-            // This wrapper will call main test routine in a Lua runtime running
-            // inside picodata instance.
-            let test_runner_ident = test_fn.sig.ident.clone();
-
-            // Name of the function to be invoked on instance-side as test payload
-            let test_idx = UNIT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Acquire);
-            let ffi_test_callable = format!("test_impl_{test_idx}_{test_fn_name}");
-            test_fn.sig.ident = Ident::new(&ffi_test_callable, test_fn.sig.ident.span());
-
-            let tokens = quote! {
-                #[test]
-                fn #test_runner_ident() {
-                    use picotest::internal;
-
-                    let plugin_path = internal::plugin_root_dir();
-                    let plugin_dylib_path =
-                        internal::plugin_dylib_path(&plugin_path, env!("CARGO_PKG_NAME"));
-                    let plugin_topology = internal::get_or_create_unit_test_topology();
-
-                    let call_test_fn_query =
-                        internal::lua_ffi_call_unit_test(
-                            #ffi_test_callable, plugin_dylib_path.to_str().unwrap());
-
-                    let cluster = picotest::get_or_create_session_cluster(
-                        plugin_topology.into(),
-                    );
-
-                    let output = cluster.run_lua(call_test_fn_query)
-                        .expect("Failed to execute query");
-
-                    if let Err(err) = internal::verify_unit_test_output(&output) {
-                        for l in output.split("----") {
-                            println!("[Lua] {l}")
-                        }
-                        panic!("Test '{}' exited with failure: {}", #test_fn_name, err);
-                    }
-                }
+        Item::Fn(test_fn) => {
+            // Defines `plugin_dylib_path`.
+            let dylib_setup = quote! {
+                let plugin_path = internal::plugin_root_dir();
+                let plugin_dylib_path =
+                    internal::plugin_dylib_path(&plugin_path, env!("CARGO_PKG_NAME"));
+                let plugin_topology = internal::get_or_create_unit_test_topology();
             };
-
-            let mut test_runner: ItemFn =
-                parse(tokens.into()).expect("Runner routine tokens must be parsed");
-
-            // Preserve attributes added to source test routine.
-            test_runner.attrs.extend(test_fn_attrs);
-
-            quote! {
-                #test_fn
-                #test_runner
-            }
-            .into()
+            // Defines `cluster` with `run_lua`.
+            let runner_setup = quote! {
+                let cluster = picotest::get_or_create_session_cluster(
+                    plugin_topology.into(),
+                );
+            };
+            generate_ffi_test(test_fn, dylib_setup, runner_setup)
         }
         _ => panic!("The #[picotest_unit] macro is only valid when called on a function."),
     }
+}
+
+/// Runs the test inside a single bare Picodata instance, without plugin
+/// machinery. Tests of one test binary run one after another.
+#[proc_macro_attribute]
+pub fn picotest_standalone(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    parse_macro_input!(attr as Nothing);
+    match parse_macro_input!(tokens as Item) {
+        Item::Fn(test_fn) => {
+            let test_fn_name = test_fn.sig.ident.to_string();
+            let dylib_setup = quote! {
+                let plugin_dylib_path = picotest::standalone::dylib_path(
+                    env!("CARGO_CRATE_NAME"),
+                    env!("CARGO_MANIFEST_DIR"),
+                );
+            };
+            let runner_setup = quote! {
+                let mut cluster = picotest::standalone::acquire(
+                    concat!(module_path!(), "::", #test_fn_name),
+                    env!("CARGO_MANIFEST_DIR"),
+                );
+            };
+            generate_ffi_test(test_fn, dylib_setup, runner_setup)
+        }
+        _ => panic!("The #[picotest_standalone] macro is only valid when called on a function."),
+    }
+}
+
+/// Generates an `extern "C"` test routine and a `#[test]` wrapper calling it
+/// through FFI inside a Picodata instance.
+///
+/// - `dylib_setup` must define `plugin_dylib_path` - path to the shared
+///   library containing the test routine.
+/// - `runner_setup` must define `cluster` - an object with `run_lua`.
+fn generate_ffi_test(
+    mut test_fn: ItemFn,
+    dylib_setup: proc_macro2::TokenStream,
+    runner_setup: proc_macro2::TokenStream,
+) -> TokenStream {
+    let test_fn_attrs = test_fn.attrs.clone();
+    let test_fn_name = test_fn.sig.ident.to_string();
+    // We want test routine to be called through FFI.
+    // So mark it as 'pub extern "C"'.
+    test_fn.vis = parse_quote! { pub };
+    test_fn.sig.abi = parse_quote! { extern "C" };
+    // Set no mangle attribute to avoid spoiling of function signature.
+    test_fn.attrs = vec![
+        parse_quote! { #[allow(dead_code)]  },
+        parse_quote! { #[unsafe(no_mangle)] },
+    ];
+
+    // Create test runner - it's a wrapper around main test function.
+    // This wrapper will call main test routine in a Lua runtime running
+    // inside picodata instance.
+    let test_runner_ident = test_fn.sig.ident.clone();
+
+    // Name of the function to be invoked on instance-side as test payload.
+    // The counter is shared by all modes: symbols are `#[no_mangle]`, so
+    // same-named tests of different modes must not get the same index.
+    let test_idx = UNIT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Acquire);
+    let ffi_test_callable = format!("test_impl_{test_idx}_{test_fn_name}");
+    test_fn.sig.ident = Ident::new(&ffi_test_callable, test_fn.sig.ident.span());
+
+    let tokens = quote! {
+        #[test]
+        fn #test_runner_ident() {
+            use picotest::internal;
+
+            #dylib_setup
+
+            let call_test_fn_query =
+                internal::lua_ffi_call_unit_test(
+                    #ffi_test_callable, plugin_dylib_path.to_str().unwrap());
+
+            #runner_setup
+
+            let output = cluster.run_lua(call_test_fn_query)
+                .expect("Failed to execute query");
+
+            if let Err(err) = internal::verify_unit_test_output(&output) {
+                for l in output.split("----") {
+                    println!("[Lua] {l}")
+                }
+                panic!("Test '{}' exited with failure: {}", #test_fn_name, err);
+            }
+        }
+    };
+
+    let mut test_runner: ItemFn =
+        parse(tokens.into()).expect("Runner routine tokens must be parsed");
+
+    // Preserve attributes added to source test routine.
+    test_runner.attrs.extend(test_fn_attrs);
+
+    quote! {
+        #test_fn
+        #test_runner
+    }
+    .into()
 }

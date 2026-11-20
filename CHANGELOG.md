@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ## [Unreleased]
 
+### Added
+
+* Атрибут `#[picotest_standalone]` для тестов в одном инстансе Пикодаты без механизма плагинов: проекту не нужны `topology.toml`, манифест и миграции. Заменяет `tarantool-test` (см. ADR-0001)
+
 ### Fixed
 
 * Определение каталога сборки (`cargo_target_dir`) для layout cargo, в котором тестовые бинари лежат не в `<target>/<profile>/deps`

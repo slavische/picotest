@@ -1,6 +1,6 @@
 use dtor::dtor;
 pub use picotest_helpers::{
-    topology::PluginTopology, Cluster, PICOTEST_USER, PICOTEST_USER_PASSWORD,
+    standalone, topology::PluginTopology, Cluster, PICOTEST_USER, PICOTEST_USER_PASSWORD,
 };
 pub use picotest_macros::*;
 pub use rstest::*;
@@ -87,4 +87,11 @@ unsafe fn tear_down() {
         }
     }
     assert!(!failed, "Failed to stop the cluster");
+}
+
+#[dtor]
+unsafe fn tear_down_standalone() {
+    if let Err(err) = standalone::stop() {
+        eprintln!("Failed to stop standalone picodata instance: {err:#}");
+    }
 }

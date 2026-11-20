@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 pub mod migration;
 pub mod slot;
+pub mod standalone;
 pub mod topology;
 
 pub type PluginConfigMap = pike::config::PluginConfigMap;
@@ -238,44 +239,8 @@ impl PicotestInstance {
         Ok(response_decoded)
     }
 
-    fn read_output<T: Read>(&self, reader: T) -> Result<String, Error> {
-        BufReader::new(reader)
-            .lines()
-            .skip(2)
-            .take_while(|line| line.as_ref().is_ok_and(|l| l != OUTPUT_FOOTER))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|lines| lines.join("\n"))
-    }
-
     fn run_query<T: AsRef<[u8]>>(&self, query: T) -> Result<String, Error> {
-        let mut picodata_admin = self.await_picodata_admin()?;
-
-        let stdout = picodata_admin
-            .stdout
-            .take()
-            .expect("Failed to capture stdout");
-        let stderr = picodata_admin
-            .stderr
-            .take()
-            .expect("Failed to capture stderr");
-        {
-            let picodata_stdin = picodata_admin.stdin.as_mut().unwrap();
-            picodata_stdin.write_all(query.as_ref())?;
-            picodata_admin.wait()?;
-        }
-
-        let result = self.read_output(stdout)?;
-        if result.is_empty() {
-            let mut err_output = String::new();
-            BufReader::new(stderr).read_to_string(&mut err_output)?;
-            if !err_output.is_empty() {
-                picodata_admin.kill()?;
-                return Err(Error::other(err_output));
-            }
-        }
-        picodata_admin.kill()?;
-
-        Ok(result)
+        run_admin_query(Path::new("picodata"), &self.socket_path, query.as_ref())
     }
 
     /// Executes Lua script through picodata's query mechanism.
@@ -301,11 +266,7 @@ impl PicotestInstance {
     /// }
     /// ```
     pub fn run_lua<T: AsRef<[u8]>>(&self, query: T) -> Result<String, Error> {
-        let output = self.run_query([b"\\lua\n", query.as_ref()].concat())?;
-        // Chomp header if exists or keep output as is.
-        let output = output.strip_prefix(LUA_OUTPUT_HEADER).unwrap_or(&output);
-
-        Ok(output.to_owned())
+        run_admin_lua(Path::new("picodata"), &self.socket_path, query.as_ref())
     }
 
     /// Executes an SQL query through the picodata admin console.
@@ -337,33 +298,94 @@ impl PicotestInstance {
     pub fn run_sql<T: AsRef<[u8]>>(&self, query: T) -> Result<String, Error> {
         self.run_query(query)
     }
+}
 
-    fn await_picodata_admin(&self) -> Result<Child, Error> {
-        let timeout = Duration::from_secs(60);
-        let start_time = Instant::now();
-        loop {
-            assert!(
-                start_time.elapsed() < timeout,
-                "process hanging for too long"
-            );
+/// Executes a query through the admin console of the instance listening on `socket_path`.
+///
+/// Spawns `picodata admin`, writes the query to its stdin and returns
+/// the console output without the greeting and the footer.
+pub(crate) fn run_admin_query(
+    picodata_path: &Path,
+    socket_path: &Path,
+    query: &[u8],
+) -> Result<String, Error> {
+    let mut picodata_admin = await_picodata_admin(picodata_path, socket_path)?;
 
-            let picodata_admin = Command::new("picodata")
-                .arg("admin")
-                .arg(ADMIN_SOCKET_NAME)
-                .current_dir(self.socket_path.parent().unwrap())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
+    let stdout = picodata_admin
+        .stdout
+        .take()
+        .expect("Failed to capture stdout");
+    let stderr = picodata_admin
+        .stderr
+        .take()
+        .expect("Failed to capture stderr");
+    {
+        let picodata_stdin = picodata_admin.stdin.as_mut().unwrap();
+        picodata_stdin.write_all(query)?;
+        picodata_admin.wait()?;
+    }
 
-            match picodata_admin {
-                Ok(process) => {
-                    info!("Successfully connected to picodata cluster.");
-                    return Ok(process);
-                }
-                Err(_) => {
-                    std::thread::sleep(Duration::from_secs(1));
-                }
+    let result = read_admin_output(stdout)?;
+    if result.is_empty() {
+        let mut err_output = String::new();
+        BufReader::new(stderr).read_to_string(&mut err_output)?;
+        if !err_output.is_empty() {
+            picodata_admin.kill()?;
+            return Err(Error::other(err_output));
+        }
+    }
+    picodata_admin.kill()?;
+
+    Ok(result)
+}
+
+/// Executes a Lua script through the admin console, see [`run_admin_query`].
+pub(crate) fn run_admin_lua(
+    picodata_path: &Path,
+    socket_path: &Path,
+    query: &[u8],
+) -> Result<String, Error> {
+    let output = run_admin_query(picodata_path, socket_path, &[b"\\lua\n", query].concat())?;
+    // Chomp header if exists or keep output as is.
+    let output = output.strip_prefix(LUA_OUTPUT_HEADER).unwrap_or(&output);
+
+    Ok(output.to_owned())
+}
+
+fn read_admin_output<T: Read>(reader: T) -> Result<String, Error> {
+    BufReader::new(reader)
+        .lines()
+        .skip(2)
+        .take_while(|line| line.as_ref().is_ok_and(|l| l != OUTPUT_FOOTER))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|lines| lines.join("\n"))
+}
+
+fn await_picodata_admin(picodata_path: &Path, socket_path: &Path) -> Result<Child, Error> {
+    let timeout = Duration::from_secs(60);
+    let start_time = Instant::now();
+    loop {
+        assert!(
+            start_time.elapsed() < timeout,
+            "process hanging for too long"
+        );
+
+        let picodata_admin = Command::new(picodata_path)
+            .arg("admin")
+            .arg(socket_path.file_name().unwrap())
+            .current_dir(socket_path.parent().unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+
+        match picodata_admin {
+            Ok(process) => {
+                info!("Successfully connected to picodata cluster.");
+                return Ok(process);
+            }
+            Err(_) => {
+                std::thread::sleep(Duration::from_secs(1));
             }
         }
     }
