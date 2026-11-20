@@ -77,11 +77,18 @@ fn instance_stop_signal() -> Signal {
 /// built into, or `None` if it can't be identified.
 pub fn cargo_target_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let deps_dir = exe.parent()?;
-    if deps_dir.file_name()? != "deps" {
-        return None;
+    let parent = exe.parent()?;
+    // Classic layout: `<target>/<profile>/deps/<test binary>`.
+    if parent.file_name()? == "deps" {
+        return Some(parent.parent()?.parent()?.to_path_buf());
     }
-    Some(deps_dir.parent()?.parent()?.to_path_buf())
+    // Newer layouts put test binaries deeper, e.g.
+    // `<target>/<profile>/build/<package>/<hash>/out/<test binary>`.
+    // Cargo marks the root of the target directory with `CACHEDIR.TAG`.
+    exe.ancestors()
+        .skip(1)
+        .find(|dir| dir.join("CACHEDIR.TAG").is_file())
+        .map(Path::to_path_buf)
 }
 
 pub fn tmp_dir() -> PathBuf {

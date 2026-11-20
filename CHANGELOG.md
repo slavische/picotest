@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+* Определение каталога сборки (`cargo_target_dir`) для layout cargo, в котором тестовые бинари лежат не в `<target>/<profile>/deps`
+
 ## [4.1.0]
 
 ### Changed
